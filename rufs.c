@@ -30,6 +30,17 @@ char diskfile_path[PATH_MAX];
  * Get available inode number from bitmap
  */
 int get_avail_ino() {
+	struct superblock sb;
+	uint8_t buffer[BLOCK_SIZE];
+
+	//read superblock from disk, we set it at block 0
+	if (bio_read(0, buffer) < 0){
+		fprintf(stderr, "Error, Unable to read superblock.\n");
+		return -1;
+	}
+	//copy superblock information to sb
+	memcpy(&sb, buffer, sizeof(struct superblock));
+
 	uint8_t buf[BLOCK_SIZE]; // Buffer to hold the bitmap block
     int max_inodes = sb.max_inum;
 
@@ -70,14 +81,43 @@ int get_avail_ino() {
  * Get available data block number from bitmap
  */
 int get_avail_blkno() {
-
-	// Step 1: Read data block bitmap from disk
+	uint8_t buffer[BLOCK_SIZE];
 	
+	struct superblock sb;
+	//read superblock from disk, we set it at block 0
+	if (bio_read(0, buffer) < 0){
+		fprintf(stderr, "Error, Unable to read superblock.\n");
+		return -1;
+	}
+	//copy superblock information to sb
+	memcpy(&sb, buffer, sizeof(struct superblock));
+
+	int max_blocks = sb.max_dnum;
+	// Step 1: Read data block bitmap from disk
+	if(bio_read(sb.d_bitmap_blk, buffer) < 0){
+		fprintf(stderr, "Error, Unable to read data block bitmap.\n");
+		return -1;
+	}
 	// Step 2: Traverse data block bitmap to find an available slot
+	for (int i = 0; i < max_blocks; i++){
+		//found free block
+		if (get_bitmap(buffer, i) == 0){
+			//set allocated
+			set_bitmap(buffer, i);
 
-	// Step 3: Update data block bitmap and write to disk 
+			// Step 3: Update data block bitmap and write to disk 
+			if(bio_write(sb.d_bitmap_blk, buffer) < 0){
+				fprintf(stderr, "Error: Unable to write data block to disk. \n");
+				return -1;
+			}
+			//because data blocks start at sb.d_start_blk, we add this to i
+			return sb.d_start_blk + i;
+		}
+	}
 
-	return 0;
+
+	//if no block is found return -1
+	return -1;
 }
 
 /* 
