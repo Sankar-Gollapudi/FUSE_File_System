@@ -255,9 +255,22 @@ static void *rufs_init(struct fuse_conn_info *conn) {
 	if (diskfile == -1){
 		rufs_mkfs();
 	}
-  // Step 1b: If disk file is found, just initialize in-memory data structures
-  // and read superblock from disk
-
+	// Step 1b: If disk file is found, just initialize in-memory data structures
+  	// and read superblock from disk
+	
+	//Currently no in_mem data structures so just read superblock from disk I suppose
+	if (diskfile == -1){
+		if (dev_open(diskfile_path) < 0){
+			fprintf(stderr, "Error: Unable to open disk file %s. \n", diskfile_path);
+			return NULL;
+		}
+	}
+	//read superblock
+	struct superblock sb;
+	if (bio_read(0, &sb) < 0) {
+		fprintf(stderr, "Error: Unable to read superblock.\n");
+		return -1;
+	}
 
 	return NULL;
 }
