@@ -84,24 +84,68 @@ int get_avail_blkno() {
  * inode operations
  */
 int readi(uint16_t ino, struct inode *inode) {
+	struct superblock sb;
+	uint8_t buffer[BLOCK_SIZE];
+	//read superblock from disk, we set it at block 0
+	if (bio_read(0, buffer) < 0){
+		fprintf(stderr, "Error, Unable to read superblock.\n");
+		return -1;
+	}
+	memcpy(&sb, buffer, sizeof(struct superblock));
 
-  // Step 1: Get the inode's on-disk block number
+	// Step 1: Get the inode's on-disk block number
+	//calculate how many inodes fit per block
+	int inodes_per_block = BLOCK_SIZE/sizeof(struct inode);
+	int block_num = sb.i_start_blk + (ino/inodes_per_block);
 
-  // Step 2: Get offset of the inode in the inode on-disk block
+	// Step 2: Get offset of the inode in the inode on-disk block
+	int offset = (ino % inodes_per_block) * sizeof(struct inode);
 
-  // Step 3: Read the block from disk and then copy into inode structure
+	// Step 3: Read the block containing the inode
+	if (bio_read(block_num, buffer) < 0){
+		fprintf(stderr, "Error, Unable to read inode block %d.\n");
+		return -1;
+	}
+	//copy inode from buffer to given pararmeter
+	memcpy(inode, buffer + offset, sizeof(struct inode));
 
 	return 0;
+  
 }
 
 int writei(uint16_t ino, struct inode *inode) {
+	struct superblock sb;
+	uint8_t buffer[BLOCK_SIZE];
+
+	//read superblock from disk, we set it at block 0
+	if (bio_read(0, buffer) < 0){
+		fprintf(stderr, "Error, Unable to read superblock.\n");
+		return -1;
+	}
+	//copy superblock information to sb
+	memcpy(&sb, buffer, sizeof(struct superblock));
 
 	// Step 1: Get the block number where this inode resides on disk
-	
+	int inodes_per_block = BLOCK_SIZE/sizeof(struct inode);
+	int block_num = sb.i_start_blk + (ino/inodes_per_block);
+
 	// Step 2: Get the offset in the block where this inode resides on disk
+	int offset = (ino % inodes_per_block) * sizeof(struct inode);
 
 	// Step 3: Write inode to disk 
+	//Read existing block so that we don't overwrite other inodes in the same block
+	if (bio_read(block_num, buffer) < 0){
+		fprintf(stderr, "Error, Unable to read inode block %d.\n");
+		return -1;
+	}
+	//overwrite specific inode
+	memcpy(buffer + offset, inode, sizeof(struct inode));
 
+	//write to disk
+	if (bio_write(block_num, buffer) < 0){
+		fprintf(stderr, "Error, Unable to write inode to block %d.\n", block_num);
+		return -1;
+	}
 	return 0;
 }
 
@@ -259,6 +303,7 @@ static void *rufs_init(struct fuse_conn_info *conn) {
   	// and read superblock from disk
 	
 	//Currently no in_mem data structures so just read superblock from disk I suppose
+	//I don't believe that rufs_mkfs inherently opens the diskfile, so open it just in case.
 	if (diskfile == -1){
 		if (dev_open(diskfile_path) < 0){
 			fprintf(stderr, "Error: Unable to open disk file %s. \n", diskfile_path);
