@@ -70,11 +70,6 @@ int get_avail_ino() {
     // If no free inode found, return error
     return -1;
 
-	// Step 1: Read inode bitmap from disk
-	
-	// Step 2: Traverse inode bitmap to find an available slot
-
-	// Step 3: Update inode bitmap and write to disk 
 }
 
 /* 
@@ -194,15 +189,58 @@ int writei(uint16_t ino, struct inode *inode) {
  * directory operations
  */
 int dir_find(uint16_t ino, const char *fname, size_t name_len, struct dirent *dirent) {
+	struct inode dir_inode;
 
   // Step 1: Call readi() to get the inode using ino (inode number of current directory)
+	if (readi(ino, &dir_inode) < 0){
+		fprintf(stderr, "Error: Unable to read inode %u. \n", ino);
+		return -1;
+	}
+
+	//Inode represents a directory, another check for debugging purposes
+	if((dir_inode.type & S_IFDIR) == 0){
+		fprintf(stderr, "Error: Inode %u is not a directory. \n", ino);
+		return -1;
+	}
 
   // Step 2: Get data block of current directory from inode
+	//Assume entries fit into direct pointers. Check each direct pointer until
+	//we find an entry or run out of blocks
+	for (int i = 0; i < 16 && dir_inode.direct_ptr[i] != -1; i++){
+		uint32_t dir_block = dir_inode.direct_ptr[i];
+		//skip if it is not assigned
+		if(dir_block == -1) {
+			continue;
+		}
+		// Step 3: Read directory's data block and check each directory entry.
+  		//If the name matches, then copy directory entry to dirent structure
+		uint8_t block_buffer[BLOCK_SIZE];
+		if (bio_read(dir_block,block_buf) < 0){
+			fprintf(stderr, "Error: Unable to read directory block %u.\n", dir_block);
+			return -1;
+		}
 
-  // Step 3: Read directory's data block and check each directory entry.
-  //If the name matches, then copy directory entry to dirent structure
+		//Each data block may contain multiple directory entries
+		//Calculate how many entries can fit in one block
+		int entries_per_block = BLOCK_SIZE/ sizeof(struct dirent);
+		struct dirent *entries = (struct dirent *)block_buffer;
+		for (int j = 0; j < entries_per_block; j++){
+			if (entries[j].valid == 1 && entries[j].len == name_len){
+				//compare the names
+				if (strncmp(entries[j].name, fname, name_len) == 0){
+					//found a match so now we copy the directory entry
+					if (dirent != NULL){
+						memcpy(dirent, &entries[j], sizeof(struct dirent));
+					}
+					return entries[j].ino //Return the inode number of the found entry
+				}
+			}
+		}
+	}
 
-	return 0;
+	
+	//if we are here then the file name was never found in the directory blocks
+	return -1;
 }
 
 int dir_add(struct inode dir_inode, uint16_t f_ino, const char *fname, size_t name_len) {
@@ -237,10 +275,81 @@ int dir_remove(struct inode dir_inode, const char *fname, size_t name_len) {
  * namei operation
  */
 int get_node_by_path(const char *path, uint16_t ino, struct inode *inode) {
-	
+	//if either parameter is NULL, return error
+	if (!path || !inode){
+		return -1;
+	}
+
+	//if path is empty or root, return the inode of ino
+	if (strcmp(path, "") == 0 || strcmp(path, "/") == 0){
+		if (readi(ino,inode) < 0){
+			return -1; //can't read starting inode
+		}
+		return 0;
+	}
+
+	//make a copy of the path
+	char *path_copy = strdup(path);
+	if (!path_copy){
+		return -1; //strdup failed
+	}
+
+	//If the path starts with '/', start from root inode 
+	// Else, use provided ino as start
+	if (path_copy[0] == '/') {
+		ino = 0;
+	}
+
+	//Load starting inode
+	struct inode current_inode;
+	if (readi(ino, &current_inode) < 0){
+		free(path_copy);
+		return -1;
+	}
+	//Tokenize the path by '/'
+	char *token;
+	//start tokenizing after skipping leading slashes
+	//can't free path_copy until much later because we use it to iterate
+	char *rest = path_copy;
+	while(*rest == '/'){
+		rest++;
+	}
+
+	while((token = strsep(&rest, "/")) != NULL){
+		if(strcmp(token, "") == 0 || strcmp(token,".") == 0){
+			//if it is empty or '.' just ignore it
+			continue;
+		}
+		//right now token is a directory component we must look up
+		//Need to make sure current inode is a dir first though.
+		if((current_inode.type & S_IFDIR) == 0){
+			//Current inode not a dir, can't proceed
+			free(path_copy);
+			return -1;
+		}
+
+		//If we have a dir, want to find next component
+		struct dirent entry;
+		int next_ino = dir_find(current_inode.ino, token, strlen(token), &entry);
+		if(next_ino < 0){
+			//not found
+			free(path_copy);
+			return -1;
+		}
+		//Read next inode, will copy to the location of current_inode and then we continue
+		//this while loop
+		if(readi((uint16_t)next_ino, &current_inode) < 0) {
+			free(path_copy);
+			return -1;
+		}
+	}
 	// Step 1: Resolve the path name, walk through path, and finally, find its inode.
 	// Note: You could either implement it in a iterative way or recursive way
 
+
+	//after walking through path, current_inode is our target
+	memcpy(inode, &current_inode, sizeof(struct inode));
+	free(path_copy);
 	return 0;
 }
 
