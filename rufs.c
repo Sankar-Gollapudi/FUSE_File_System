@@ -243,32 +243,125 @@ int dir_find(uint16_t ino, const char *fname, size_t name_len, struct dirent *di
 	return -1;
 }
 
-int dir_add(struct inode dir_inode, uint16_t f_ino, const char *fname, size_t name_len) {
+int dir_add(struct inode dir_inode, uint16_t f_ino, const char *fname, size_t name_len) 
+{
+	if (dir_find(dir_inode.ino, fname, name_len, NULL) == 0) 
+	{
+		fprintf(stderr, "Error: File name already used\n");
+        return -1;
+    }
 
-	// Step 1: Read dir_inode's data block and check each directory entry of dir_inode
-	
-	// Step 2: Check if fname (directory name) is already used in other entries
+    int dirents_per_block = BLOCK_SIZE / sizeof(struct dirent);
+    struct dirent dir_block[dirents_per_block];
 
-	// Step 3: Add directory entry in dir_inode's data block and write to disk
+    // Try to find a free slot in existing directory blocks
+    for (int i = 0; i < 16; i++) 
+	{
+        // If no block allocated, consider allocating a new one
+        if (dir_inode.direct_ptr[i] == -1) 
+		{
+            // Allocate a new data block
+            int new_block = get_avail_blkno();
+            if (new_block < 0) 
+			{
+				fprintf(stderr, "Error: get_avail_blkno() failed\n");
+                return -1;
+            }
 
-	// Allocate a new data block for this directory if it does not exist
+            dir_inode.direct_ptr[i] = new_block;
 
-	// Update directory inode
+            // Initialize the new block with empty dirents
+            memset(dir_block, 0, sizeof(dir_block));
+            if (bio_write(new_block, dir_block) < 0) 
+			{
+				fprintf(stderr, "Error: bio_write() failed\n");
+                return -1;
+            }
+        }
 
-	// Write directory entry
+        // Read the block
+        if (bio_read(dir_inode.direct_ptr[i], dir_block) < 0) 
+		{
+			fprintf(stderr, "Error: bio_read() failed\n");
+            return -1;
+        }
 
-	return 0;
+        // Search for a free slot
+        for (int j = 0; j < dirents_per_block; j++) 
+		{
+            if (dir_block[j].valid == 0) 
+			{
+                // Found a free slot, fill it
+                dir_block[j].ino = f_ino;
+                dir_block[j].valid = 1;
+                dir_block[j].len = (uint16_t)name_len;
+                memset(dir_block[j].name, 0, sizeof(dir_block[j].name));
+                strncpy(dir_block[j].name, fname, name_len);
+
+                // Write updated block back
+                if (bio_write(dir_inode.direct_ptr[i], dir_block) < 0) 
+				{
+					fprintf(stderr, "Error: bio_write() failed\n");
+                    return -1;
+                }
+
+                // Update directory inode size
+                dir_inode.size += sizeof(struct dirent);
+                if (writei(dir_inode.ino, &dir_inode) < 0) 
+				{
+					fprintf(stderr, "Error: writei() failed\n");
+                    return -1;
+                }
+
+                return 0;
+            }
+        }
+    }
+
+	fprintf(stderr, "Error: No space found in existing or newly allocated blocks\n");
+    return -1;
 }
 
-int dir_remove(struct inode dir_inode, const char *fname, size_t name_len) {
+int dir_remove(struct inode dir_inode, const char *fname, size_t name_len) 
+{
+	int dirents_per_block = BLOCK_SIZE / sizeof(struct dirent);
+    struct dirent dir_block[dirents_per_block];
 
-	// Step 1: Read dir_inode's data block and checks each directory entry of dir_inode
-	
-	// Step 2: Check if fname exist
+    for (int i = 0; i < 16; i++) {
+        if (dir_inode.direct_ptr[i] == -1) continue;
 
-	// Step 3: If exist, then remove it from dir_inode's data block and write to disk
+        if (bio_read(dir_inode.direct_ptr[i], dir_block) < 0) 
+		{
+			fprintf(stderr, "Error: bio_read() failed\n");
+            return -1;
+        }
 
-	return 0;
+        for (int j = 0; j < dirents_per_block; j++) 
+		{
+            if (dir_block[j].valid == 1 && dir_block[j].len == name_len && strncmp(dir_block[j].name, fname, name_len) == 0) 
+            {
+                dir_block[j].valid = 0; // Invalidate this entry
+
+                if (bio_write(dir_inode.direct_ptr[i], dir_block) < 0) 
+				{
+					fprintf(stderr, "Error: bio_write() failed\n");
+                    return -1;
+                }
+
+                dir_inode.size -= sizeof(struct dirent);
+                if (writei(dir_inode.ino, &dir_inode) < 0) 
+				{
+					fprintf(stderr, "Error: writei() failed\n");
+                    return -1;
+                }
+
+                return 0;
+            }
+        }
+    }
+
+    fprintf(stderr, "Error: Directory entry not found\n");
+    return -1;
 }
 
 /* 
@@ -509,58 +602,311 @@ static int rufs_getattr(const char *path, struct stat *stbuf) {
 	return 0;
 }
 
-static int rufs_opendir(const char *path, struct fuse_file_info *fi) {
-
-	// Step 1: Call get_node_by_path() to get inode from path
-
-	// Step 2: If not find, return -1
+static int rufs_opendir(const char *path, struct fuse_file_info *fi) 
+{
+	struct inode inode;
+    if (get_node_by_path(path, 0, &inode) < 0) 
+    {
+        fprintf(stderr, "Error: File does not exist\n");
+        return -1;
+    }
 
     return 0;
 }
 
-static int rufs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
+static int rufs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
+{
+    struct inode dir_inode;
+    int ret = get_node_by_path(path, 0, &dir_inode);
+    if (ret < 0)
+    {
+        fprintf(stderr, "Error: Directory not found\n");
+        return -1;
+    }
 
-	// Step 1: Call get_node_by_path() to get inode from path
+    if (!S_ISDIR(dir_inode.type)) 
+    {
+        fprintf(stderr, "Error: Not a directory\n");
+        return -1;
+    }
 
-	// Step 2: Read directory entries from its data blocks, and copy them to filler
+    int dirents_per_block = BLOCK_SIZE / sizeof(struct dirent);
+    struct dirent dir_block[dirents_per_block];
 
-	return 0;
+    filler(buffer, ".", NULL, 0);
+    filler(buffer, "..", NULL, 0);
+
+    // Iterate over data blocks of the directory
+    for (int i = 0; i < 16; i++) 
+    {
+        if (dir_inode.direct_ptr[i] == -1) continue;
+
+        if (bio_read(dir_inode.direct_ptr[i], dir_block) < 0) 
+        {
+            fprintf(stderr, "Error: bio_read() failed\n");
+            return -1;
+        }
+
+        for (int j = 0; j < dirents_per_block; j++) 
+        {
+            if (dir_block[j].valid == 1) 
+            {
+                filler(buffer, dir_block[j].name, NULL, 0);
+            }
+        }
+    }
+
+    return 0;
 }
 
+static int rufs_mkdir(const char *path, mode_t mode) 
+{
+	char *path_copy = strdup(path);
+    if (!path_copy) 
+    {
+        fprintf(stderr, "Error: Out of memory\n");
+        return -1;
+    }
 
-static int rufs_mkdir(const char *path, mode_t mode) {
+    char *parent_path = strdup(path_copy);
+    char *base_name = strdup(path_copy);
+    if (!parent_path || !base_name) 
+    {
+        fprintf(stderr, "Error: Out of memory\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
 
-	// Step 1: Use dirname() and basename() to separate parent directory path and target directory name
+    dirname(parent_path);
+    basename(base_name); 
 
-	// Step 2: Call get_node_by_path() to get inode of parent directory
+    struct inode parent_inode;
+    int ret = get_node_by_path(parent_path, 0, &parent_inode);
+    if (ret < 0) 
+    {
+        fprintf(stderr, "Error: Parent directory does not exist\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
 
-	// Step 3: Call get_avail_ino() to get an available inode number
+    // Allocate a new inode for the new directory
+    int new_ino = get_avail_ino();
+    if (new_ino < 0) 
+    {
+        fprintf(stderr, "Error: No available inode\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return new_ino; 
+    }
 
-	// Step 4: Call dir_add() to add directory entry of target directory to parent directory
+    // Allocate a data block for this directory
+    int new_blk = get_avail_blkno();
+    if (new_blk < 0) 
+    {
+        fprintf(stderr, "Error: No available block\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return new_blk;
+    }
 
-	// Step 5: Update inode for target directory
+    // Initialize the new directory inode
+    struct inode dir_inode;
+    memset(&dir_inode, 0, sizeof(struct inode));
+    dir_inode.ino   = new_ino;
+    dir_inode.valid = 1;
+    dir_inode.size  = 0; 
+    dir_inode.type  = __S_IFDIR | mode;
+    dir_inode.link  = 2;
 
-	// Step 6: Call writei() to write inode to disk
-	
+    for (int i = 0; i < 16; i++) 
+    {
+        dir_inode.direct_ptr[i] = -1;
+        if (i < 8) dir_inode.indirect_ptr[i] = -1;
+    }
 
-	return 0;
+    dir_inode.direct_ptr[0]  = new_blk;
+    dir_inode.vstat.st_mode  = dir_inode.type;
+    dir_inode.vstat.st_uid   = getuid();
+    dir_inode.vstat.st_gid   = getgid();
+    dir_inode.vstat.st_size  = dir_inode.size;
+    time_t current_time      = time(NULL);
+    dir_inode.vstat.st_atime = current_time;
+    dir_inode.vstat.st_mtime = current_time;
+    dir_inode.vstat.st_ctime = current_time;
+    dir_inode.vstat.st_nlink = dir_inode.link;
+
+    // Add the directory entry to the parent directory
+    ret = dir_add(parent_inode, new_ino, base_name, strlen(base_name));
+    if (ret < 0) 
+    {
+        fprintf(stderr, "Error: dir_add() failed\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return ret;
+    }
+
+    // Write the new directory inode to disk
+    if (writei(new_ino, &dir_inode) < 0) 
+    {
+        fprintf(stderr, "Error: writei() failed\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
+
+    free(path_copy);
+    free(parent_path);
+    free(base_name);
+
+    return 0;
 }
 
-static int rufs_rmdir(const char *path) {
+static int rufs_rmdir(const char *path) 
+{
+	char *path_copy = strdup(path);
+    if (!path_copy) 
+    {
+        fprintf(stderr, "Error: Out of memory\n");
+        return -1;
+    }
 
-	// Step 1: Use dirname() and basename() to separate parent directory path and target directory name
+    char *parent_path = strdup(path_copy);
+    char *base_name = strdup(path_copy);
+    if (!parent_path || !base_name) 
+    {
+        fprintf(stderr, "Error: Out of memory\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
 
-	// Step 2: Call get_node_by_path() to get inode of target directory
+    dirname(parent_path); // parent directory path
+    basename(base_name);  // directory name to remove
 
-	// Step 3: Clear data block bitmap of target directory
+    // Get the inode of the directory to remove
+    struct inode dir_inode;
+    int ret = get_node_by_path(path, 0, &dir_inode);
+    if (ret < 0) 
+    {
+        fprintf(stderr, "Error: Directory does not exist\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
 
-	// Step 4: Clear inode bitmap and its data block
+    // Check if it's a directory
+    if (!S_ISDIR(dir_inode.type)) 
+    {
+        fprintf(stderr, "Error: Not a directory\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
 
-	// Step 5: Call get_node_by_path() to get inode of parent directory
+    // Check if directory is empty (no valid entries)
+    int dirents_per_block = BLOCK_SIZE / sizeof(struct dirent);
+    struct dirent dir_block[dirents_per_block];
+    int empty = 1;
+    for (int i = 0; i < 16 && empty; i++) 
+    {
+        if (dir_inode.direct_ptr[i] == -1) continue;
+        if (bio_read(dir_inode.direct_ptr[i], dir_block) < 0) 
+        {
+            fprintf(stderr, "Error: bio_read() failed\n");
+            free(path_copy);
+            free(parent_path);
+            free(base_name);
+            return -1;
+        }
 
-	// Step 6: Call dir_remove() to remove directory entry of target directory in its parent directory
+        for (int j = 0; j < dirents_per_block; j++) 
+        {
+            if (dir_block[j].valid == 1) 
+            {
+                empty = 0;
+                break;
+            }
+        }
+    }
 
-	return 0;
+    if (!empty) 
+    {
+        fprintf(stderr, "Error: Directory not empty\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
+
+    // Free data blocks used by this directory
+    for (int i = 0; i < 16; i++) 
+    {
+        if (dir_inode.direct_ptr[i] != -1) 
+        {
+            int blkno = dir_inode.direct_ptr[i] - sb.d_start_blk;
+            unset_bitmap(data_bitmap, blkno);
+        }
+    }
+
+    // Write updated data bitmap
+    if (bio_write(sb.d_bitmap_blk, data_bitmap) < 0) 
+    {
+        fprintf(stderr, "Error: bio_write() failed\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
+
+    // Clear inode bitmap for this directory
+    unset_bitmap(inode_bitmap, dir_inode.ino);
+    if (bio_write(sb.i_bitmap_blk, inode_bitmap) < 0) 
+    {
+        fprintf(stderr, "Error: bio_write() failed\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -1;
+    }
+
+    // Get parent directory inode
+    struct inode parent_inode;
+    ret = get_node_by_path(parent_path, 0, &parent_inode);
+    if (ret < 0) 
+    {
+        fprintf(stderr, "Error: Parent directory does not exist\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return -ENOENT;
+    }
+
+    // Remove directory entry from parent
+    ret = dir_remove(parent_inode, base_name, strlen(base_name));
+    if (ret < 0) 
+    {
+        fprintf(stderr, "Error: dir_remove() failed\n");
+        free(path_copy);
+        free(parent_path);
+        free(base_name);
+        return ret;
+    }
+
+    free(path_copy);
+    free(parent_path);
+    free(base_name);
+    return 0;
 }
 
 static int rufs_releasedir(const char *path, struct fuse_file_info *fi) {
