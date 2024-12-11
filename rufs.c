@@ -916,21 +916,84 @@ static int rufs_releasedir(const char *path, struct fuse_file_info *fi) {
 }
 
 static int rufs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+	if(!path){
+		return -EINVAL;
+	}
+	// Make copy of path because dirname() and basename() may modify them
+	char path_copy[PATH_MAX], dir_path[PATH_MAX], file_name[PATH_MAX];
+	strncpy(path_copy, path, PATH_MAX);
+	//null terminating character
+	path_copy[PATH_MAX-1] = '\0';
 
 	// Step 1: Use dirname() and basename() to separate parent directory path and target file name
+	strncpy(dir_path, path_copy, PATH_MAX);
+	dir_path[PATH_MAX-1] = '\0';
+	strncpy(file_name, path_copy, PATH_MAX);
+	file_name[PATH_MAX-1] = '\0';
+	char *parent_dir = dirname(dir_path);
+	char *target_name = basename(file_name);
 
+	
 	// Step 2: Call get_node_by_path() to get inode of parent directory
+	struct inode parent_inode;
+	if(get_node_by_path(parent_dir, 0, &parent_inode) < 0){
+		//parent dir not found
+		return -ENOENT;
+	}
+
+	//Check if file exists
+	struct inode existing_inode;
+	if(get_node_by_path(path, 0, &existing_inode) == 0) {
+		//File exists
+		return -EEXIST;
+	}
 
 	// Step 3: Call get_avail_ino() to get an available inode number
+	int new_ino = get_avail_ino();
+	if (new_ino < 0) {
+		//no available inodes
+		return -ENOSPC;
+	}
 
 	// Step 4: Call dir_add() to add directory entry of target file to parent directory
+	if (dir_add(parent_inode, (uint16_t)new_ino, target_name, strlen(target_name)) < 0){
+		//adding dir entry error
+		return -EIO;
+	}
 
 	// Step 5: Update inode for target file
+	struct inode new_inode;
+	memset(&new_inode, 0, sizeof(struct inode));
+	new_inode.ino = (uint16_t)new_ino;
+	new_inode.valid = 1;
+	new_inode.size = 0;
+	new_inode.type = S_IFREG | (mode & 0777) //check it is a regular file with given perms
+	new_inode.link = 1; //One link from parent dir
+	for(int i = 0; i < 16; i++){
+		new_inode.direct_ptr[i] = -1;
+	}
+	for(int i = 0; i < 8; i++){
+		new_inode.indirect_ptr[i] = -1;
+	}
+
+	//adjust vstat
+	new_inode.vstat.st_uid = getuid();
+	new_inode.vstat.st_gid = getgid();
+	time_t now = time(NULL);
+	new_inode.vstat.st_atime = now;
+	new_inode.vstat.st_mtime = now;
+	new_inode.vstat.st_ctime = now;
 
 	// Step 6: Call writei() to write inode to disk
+	if (write(new_inode.ino, &new_inode) < 0){
+		//failed to write
+		return -EIO;
+	}
+
 
 	return 0;
 }
+
 
 static int rufs_open(const char *path, struct fuse_file_info *fi) {
 	struct inode file_inode;
