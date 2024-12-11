@@ -21,7 +21,7 @@
 
 #include "block.h"
 #include "rufs.h"
-
+extern int diskfile; //so that it compiles
 char diskfile_path[PATH_MAX];
 
 // Declare your in-memory data structures here
@@ -138,7 +138,7 @@ int readi(uint16_t ino, struct inode *inode) {
 
 	// Step 3: Read the block containing the inode
 	if (bio_read(block_num, buffer) < 0){
-		fprintf(stderr, "Error, Unable to read inode block %d.\n");
+		fprintf(stderr, "Error, Unable to read inode block %d.\n", block_num);
 		return -1;
 	}
 	//copy inode from buffer to given pararmeter
@@ -170,7 +170,7 @@ int writei(uint16_t ino, struct inode *inode) {
 	// Step 3: Write inode to disk 
 	//Read existing block so that we don't overwrite other inodes in the same block
 	if (bio_read(block_num, buffer) < 0){
-		fprintf(stderr, "Error, Unable to read inode block %d.\n");
+		fprintf(stderr, "Error, Unable to read inode block %d.\n", block_num);
 		return -1;
 	}
 	//overwrite specific inode
@@ -215,7 +215,7 @@ int dir_find(uint16_t ino, const char *fname, size_t name_len, struct dirent *di
 		// Step 3: Read directory's data block and check each directory entry.
   		//If the name matches, then copy directory entry to dirent structure
 		uint8_t block_buffer[BLOCK_SIZE];
-		if (bio_read(dir_block,block_buf) < 0){
+		if (bio_read(dir_block,block_buffer) < 0){
 			fprintf(stderr, "Error: Unable to read directory block %u.\n", dir_block);
 			return -1;
 		}
@@ -232,7 +232,7 @@ int dir_find(uint16_t ino, const char *fname, size_t name_len, struct dirent *di
 					if (dirent != NULL){
 						memcpy(dirent, &entries[j], sizeof(struct dirent));
 					}
-					return entries[j].ino //Return the inode number of the found entry
+					return entries[j].ino; //Return the inode number of the found entry
 				}
 			}
 		}
@@ -480,7 +480,7 @@ int rufs_mkfs() {
 	//use memset here because initializing at 0 is actually relevant
 	memset(&i_bitmap, 0, MAX_INUM/8);
 	//reserve root inode
-	set_bitmap(&i_bitmap, 0);
+	set_bitmap(i_bitmap, 0);
 	uint8_t i_bitmapblock[BLOCK_SIZE];
 	memset(i_bitmapblock, 0, BLOCK_SIZE);
 	memcpy(i_bitmapblock, &i_bitmap, MAX_INUM/8);
@@ -494,7 +494,7 @@ int rufs_mkfs() {
 	memset(&d_bitmap, 0, MAX_DNUM/8);
 
 	//Reserve one block for root directory
-	set_bitmap(&d_bitmap, 0);
+	set_bitmap(d_bitmap, 0);
 	//write data bitmap to disk
 	uint8_t d_bitmapblock[BLOCK_SIZE];
 	memset(d_bitmapblock, 0, BLOCK_SIZE);
@@ -526,7 +526,7 @@ int rufs_mkfs() {
 	memcpy(inode_block_buffer, &root_inode, sizeof(struct inode));
 	if(bio_write(root_inode_block, inode_block_buffer) < 0){
 		fprintf(stderr, "Error: Unable to write root inode. \n");
-		reutnr -1;
+		return -1;
 	}
 	return 0;
 }
@@ -556,7 +556,7 @@ static void *rufs_init(struct fuse_conn_info *conn) {
 	struct superblock sb;
 	if (bio_read(0, &sb) < 0) {
 		fprintf(stderr, "Error: Unable to read superblock.\n");
-		return -1;
+		return NULL;
 	}
 
 	return NULL;
@@ -577,7 +577,7 @@ static int rufs_getattr(const char *path, struct stat *stbuf) {
 	// Step 1: call get_node_by_path() to get inode from path
 	if (get_node_by_path(path, 0, &node) < 0){
 		//not found
-		return -ENOENT
+		return -ENOENT;
 	}
 
 
@@ -967,7 +967,7 @@ static int rufs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	new_inode.ino = (uint16_t)new_ino;
 	new_inode.valid = 1;
 	new_inode.size = 0;
-	new_inode.type = S_IFREG | (mode & 0777) //check it is a regular file with given perms
+	new_inode.type = S_IFREG | (mode & 0777); //check it is a regular file with given perms
 	new_inode.link = 1; //One link from parent dir
 	for(int i = 0; i < 16; i++){
 		new_inode.direct_ptr[i] = -1;
@@ -985,7 +985,7 @@ static int rufs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	new_inode.vstat.st_ctime = now;
 
 	// Step 6: Call writei() to write inode to disk
-	if (write(new_inode.ino, &new_inode) < 0){
+	if (writei(new_inode.ino, &new_inode) < 0){
 		//failed to write
 		return -EIO;
 	}
@@ -1021,7 +1021,7 @@ static int rufs_read(const char *path, char *buffer, size_t size, off_t offset, 
 	}
 
 	//Adjust size if it goes beyond end of file
-	if (offset + size > file.inode.size){
+	if (offset + size > file_inode.size){
 		size = file_inode.size - offset;
 	}
 
@@ -1135,7 +1135,7 @@ static int rufs_write(const char *path, const char *buffer, size_t size, off_t o
 		//Read block into a temp buffer
 		uint8_t data_block[BLOCK_SIZE];
 		if (bio_read(blk_no, data_block) < 0){
-			fprtinf(stderr, "Error: Unable to read block %d.\n", blk_no);
+			fprintf(stderr, "Error: Unable to read block %d.\n", blk_no);
 			return -1;
 		}
 
@@ -1185,7 +1185,7 @@ static int rufs_unlink(const char *path) {
 	path_copy[PATH_MAX-1] = '\0';
 	// Step 1: Use dirname() and basename() to separate parent directory path and target file name
 	//some set up things:
-	char dir_name[PATH_MAX];
+	char dir_path[PATH_MAX];
 	char file_name[PATH_MAX];
 	strncpy(dir_path, path_copy, PATH_MAX);
 	dir_path[PATH_MAX-1] = '\0';
@@ -1202,7 +1202,7 @@ static int rufs_unlink(const char *path) {
 		return -ENOENT;
 	}
 	//make sure this isn't a dir
-	if((target_inode.type & S_IFDIR) == SI_IFDIR){
+	if((target_inode.type & S_IFDIR) == S_IFDIR){
 		//Trying to unlik a dir is illegal so return error is directory
 		return -EISDIR;
 	}
@@ -1275,7 +1275,7 @@ static int rufs_unlink(const char *path) {
 
 	// Step 6: Call dir_remove() to remove directory entry of target file in its parent directory
 	if (dir_remove(parent_inode, target_name, strlen(target_name)) < 0){
-		fprintf(stderr "Error: Unable to remove directory entry for %s.\n", target_name);
+		fprintf(stderr, "Error: Unable to remove directory entry for %s.\n", target_name);
 		return -1;
 	}
 
