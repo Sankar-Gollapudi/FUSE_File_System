@@ -479,14 +479,32 @@ static void rufs_destroy(void *userdata) {
 }
 
 static int rufs_getattr(const char *path, struct stat *stbuf) {
-
+	struct inode node;
+	memset(stbuf, 0, sizeof(struct stat));
 	// Step 1: call get_node_by_path() to get inode from path
+	if (get_node_by_path(path, 0, &node) < 0){
+		//not found
+		return -ENOENT
+	}
+
 
 	// Step 2: fill attribute of file into stbuf from inode
+	stbuf->st_mode = node.type;
+	stbuf->st_nlink = node.link;
+	stbuf->st_size = node.size;
 
-		stbuf->st_mode   = S_IFDIR | 0755;
-		stbuf->st_nlink  = 2;
-		time(&stbuf->st_mtime);
+	//not sure if we are maintaining vstat, but just for good measure:
+	
+	stbuf-> st_uid = node.vstat.st_uid;
+	stbuf-> st_gid = node.vstat.st_gid;
+	stbuf-> st_atime = node.vstat.st_atime;
+	stbuf-> st_mtime = node.vstat.st_mtime;
+	stbuf-> st_ctime = node.vstat.st_ctime;
+	stbuf-> st_mode |= 7055;
+
+		//stbuf->st_mode   = S_IFDIR | 0755;
+		//stbuf->st_nlink  = 2;
+		//time(&stbuf->st_mtime);
 
 	return 0;
 }
@@ -580,28 +598,171 @@ static int rufs_open(const char *path, struct fuse_file_info *fi) {
 }
 
 static int rufs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi) {
+	struct inode file_inode;
 
 	// Step 1: You could call get_node_by_path() to get inode from path
+	if(get_node_by_path(path, 0, &file_inode) < 0){
+		//file DNE
+		return -ENOENT;
+	}
+
+	//if offset extends beyond end of file then there is nothing to read
+	if (offset >= file_inode.size) {
+		return 0;
+	}
+
+	//Adjust size if it goes beyond end of file
+	if (offset + size > file.inode.size){
+		size = file_inode.size - offset;
+	}
 
 	// Step 2: Based on size and offset, read its data blocks from disk
+	size_t bytes_read = 0; //how many bytes we have read into buffer
+	size_t bytes_to_read = size;
+	off_t current_offset = offset;
 
-	// Step 3: copy the correct amount of data from offset to buffer
+	uint8_t block_buffer[BLOCK_SIZE];
+
+	//calculate which block with which offset to start reading from
+	while (bytes_to_read > 0){
+		//which index within file
+		int block_index = current_offset/BLOCK_SIZE;
+		if (block_index >= 16 || file_inode.direct_ptr[block_index] == -1){
+			//no more blocks left
+			break;
+		}
+
+		//which block on disk
+		int block_num = file_inode.direct_ptr[block_index];
+
+		//offset within this block
+		int block_offset = current_offset % BLOCK_SIZE;
+
+		//how many bytes we can read from the block?
+		size_t bytes_from_block = BLOCK_SIZE - block_offset;
+		if(bytes_from_block > bytes_to_read) {
+			bytes_from_block = bytes_to_read;
+		}
+
+		// Step 3: copy the correct amount of data from offset to buffer
+		//First read the entire block from disk
+		if (bio_read(block_num, block_buffer) < 0){
+			//If there is a read error stop
+			break;
+		}
+
+		memcpy(buffer + bytes_read, block_buffer + block_offset, bytes_from_block);
+
+		//update counters
+		bytes_read += bytes_from_block;
+		current_offset += bytes_from_block;
+		bytes_to_read -= bytes_from_block;
+
+	}
+	
 
 	// Note: this function should return the amount of bytes you copied to buffer
-	return 0;
+	return bytes_read;
 }
 
 static int rufs_write(const char *path, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fi) {
+	struct inode file_inode;
+
 	// Step 1: You could call get_node_by_path() to get inode from path
+	if (get_node_by_path(path, 0, &file_inode) < 0){
+		//File DNE
+		return -1;
+	}
+	//Check this is indeed a file
+	if ((file_inode.type & S_IFDIR) == S_IFDIR){
+		//Can't write to a dir
+		return -1;
+	}
+
+	//Get superblock
+	struct superblock sb;
+	uint8_t block_buffer[BLOCK_SIZE];
+	if (bio_read(0, block_buffer) < 0){
+		fprintf(stderr, "Error: Unable to read superblock. \n");
+		return -1;
+	}
+	memcpy(&sb, block_buffer, sizeof(struct superblock));
 
 	// Step 2: Based on size and offset, read its data blocks from disk
+	//using off_t because it is easy to read the designation when debugging
+	off_t end_offset = offset + size;
+	int start_block = offset/ BLOCK_SIZE;
+	int end_block = (end_offset - 1)/ BLOCK_SIZE;
+
+	//make sure there are enough direct pointers. If we need more blocks then allocate them
+	for (int i = 0; i <= end_block && i < 16; i++){
+		if (file_inode.direct_ptr[i] == -1){
+			//Need a new data block if we run out
+			int new_blk = get_avail_blkno();
+			if (new_blk < 0){
+				//no space
+				return -1;
+			}
+			file_inode.direct_ptr[i] = new_blk;
+		}
+	}
+	//if end_block >= 16 we are out of dir pointers and must fail. Simplified implementation
+	if (end_block >= 16) {
+		return -1;
+	}
 
 	// Step 3: Write the correct amount of data from offset to disk
+	size_t bytes_written = 0;
+	size_t bytes_to_write = size;
+	const char *write_ptr = buffer;
 
-	// Step 4: Update the inode info and write it to disk
+	for (int b = start_block; b <= end_block; b++){
+		int blk_no = file_inode.direct_ptr[b];
+		if (blk_no == -1){
+			//This shouldn't happen but necessary for debugging because there is a repeated error here
+			fprintf(stderr, "Error, Unable to access blocks.\n");
+			return -1;
+		}
+		//Read block into a temp buffer
+		uint8_t data_block[BLOCK_SIZE];
+		if (bio_read(blk_no, data_block) < 0){
+			fprtinf(stderr, "Error: Unable to read block %d.\n", blk_no);
+			return -1;
+		}
 
+		//Calculate the offset within block
+		int block_offset = 0;
+		if (b == start_block){
+			block_offset = offset % BLOCK_SIZE;
+		}
+
+		// Step 4: Update the inode info and write it to disk
+		//Calculate how much we can write
+		int space_in_block = BLOCK_SIZE - block_offset;
+		int to_write = (bytes_to_write < (size_t)space_in_block) ? bytes_to_write : space_in_block;
+
+		//Copy data from buffer to block
+		memcpy(data_block + block_offset, write_ptr, to_write);
+
+		//write block back
+		if(bio_write(blk_no, data_block) < 0){
+			fprintf(stderr, "Error: Unable to write block %d.\n", blk_no);
+			return -1;
+		}
+
+		write_ptr += to_write;
+		bytes_written += to_write;
+		bytes_to_write -= to_write;
+
+	}
+	//if necessary update inode size
+	if (end_offset > file_inode.size){
+		file_inode.size = end_offset;
+	}
+
+	writei(file_inode.ino, &file_inode);
 	// Note: this function should return the amount of bytes you write to disk
-	return size;
+	return bytes_written;
 }
 
 static int rufs_unlink(const char *path) {
