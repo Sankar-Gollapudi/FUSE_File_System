@@ -569,10 +569,12 @@ static int rufs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 }
 
 static int rufs_open(const char *path, struct fuse_file_info *fi) {
-
+	struct inode file_inode;
 	// Step 1: Call get_node_by_path() to get inode from path
-
-	// Step 2: If not find, return -1
+	if(get_node_by_path(path, 0, &file_inode) < 0){
+		// Step 2: If not find, return -1
+		return -1;
+	}	
 
 	return 0;
 }
@@ -603,18 +605,110 @@ static int rufs_write(const char *path, const char *buffer, size_t size, off_t o
 }
 
 static int rufs_unlink(const char *path) {
+	if (!path){
+		return -1;
+	}
 
+	char path_copy[PATH_MAX];
+	strncpy(path_copy, path, PATH_MAX);
+	//ensure a terminating character
+	path_copy[PATH_MAX-1] = '\0';
 	// Step 1: Use dirname() and basename() to separate parent directory path and target file name
+	//some set up things:
+	char dir_name[PATH_MAX];
+	char file_name[PATH_MAX];
+	strncpy(dir_path, path_copy, PATH_MAX);
+	dir_path[PATH_MAX-1] = '\0';
+	strncpy(file_name, path_copy, PATH_MAX);
+	file_name[PATH_MAX-1] = '\0';
+
+	char *parent_dir = dirname(dir_path);
+	char* target_name = basename(file_name);
 
 	// Step 2: Call get_node_by_path() to get inode of target file
+	struct inode target_inode;
+	if (get_node_by_path(path, 0, &target_inode) < 0){
+		//File DNE so return error no entry
+		return -ENOENT;
+	}
+	//make sure this isn't a dir
+	if((target_inode.type & S_IFDIR) == SI_IFDIR){
+		//Trying to unlik a dir is illegal so return error is directory
+		return -EISDIR;
+	}
+
+	//Read superblock
+	struct superblock sb;
+	uint8_t block_buffer[BLOCK_SIZE];
+	if (bio_read(0, block_buffer) < 0){
+		fprintf(stderr, "Error: Unable to read superblock.\n");
+		return -1;
+	}
+	memcpy(&sb, block_buffer, sizeof(struct superblock));
 
 	// Step 3: Clear data block bitmap of target file
+	//For each valid dir pointer in target inode clear data block
+	uint8_t d_bitmap[BLOCK_SIZE];
+	if (bio_read(sb.d_bitmap_blk, d_bitmap) < 0){
+		fprintf(stderr, "Error: Unable to read data bitmap. \n");
+		return -1;
+	}
+
+	for (int i = 0; i < 16; i++){
+		int blk = target_inode.direct_ptr[i];
+		if(blk != 1){
+			//Compute index within d_bitmap
+			int data_idx = blk - sb.d_start_blk;
+			if (data_idx >= 0 && data_idx < sb.max_dnum){
+				//unset bit in data bitmap
+				unset_bitmap(d_bitmap, data_idx);
+			}
+			//reset pointer if necessary
+			target_inode.direct_ptr[i] = -1;
+
+		}
+	}
+	//write updated d_bitmap
+	if (bio_write(sb.d_bitmap_blk, d_bitmap) < 0){
+		fprintf(stderr, "Error: Unable to write data bitmap.\n");
+		return -1;
+	}
 
 	// Step 4: Clear inode bitmap and its data block
+	//clear i_bitmap entry for target_inode.ino
+	uint8_t i_bitmap[BLOCK_SIZE];
+	//Lots of error handling, useful for debugging, not so much for running
+	if (bio_read(sb.i_bitmap_blk, i_bitmap) < 0) {
+		fprintf(stderr, "Error: Unable to read inode bitmap.\n");
+		return -1;
+	}
+
+	if (get_bitmap(i_bitmap, target_inode.ino) == 1){
+		//If inode is currently allocated unset it
+		unset_bitmap(i_bitmap, target_inode.ino);
+		//write updated inode bitmap
+		if (bio_write(sb.i_bitmap_blk, i_bitmap) < 0){
+			fprintf(stderr, "Error: Unable to write inode bitmap.\n");
+			return -1;
+		}
+	}
+	//want to clean out inode from disk by writing a zeroed inode to disk. I think this was an error when we tried to run
+	memset(&target_inode, 0, sizeof(struct inode));
+	writei(target_inode.ino, &target_inode);
 
 	// Step 5: Call get_node_by_path() to get inode of parent directory
+	struct inode parent_inode;
+	if (get_node_by_path(parent_dir, 0, &parent_inode) < 0){
+		//Parent dir not found, unlikely but necessary for testing which functions fail
+		return -1;
+	}
 
 	// Step 6: Call dir_remove() to remove directory entry of target file in its parent directory
+	if (dir_remove(parent_inode, target_name, strlen(target_name)) < 0){
+		fprintf(stderr "Error: Unable to remove directory entry for %s.\n", target_name);
+		return -1;
+	}
+
 
 	return 0;
 }
